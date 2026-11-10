@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/cassava/repoctl/pacman"
 	"github.com/cassava/repoctl/pacman/alpm"
 	"github.com/cassava/repoctl/pacman/aur"
 	"github.com/cassava/repoctl/pacman/pkgutil"
+	"github.com/cassava/repoctl/pkgbuild"
 	"github.com/cassava/repoctl/repo"
 	"github.com/spf13/cobra"
 )
@@ -104,6 +106,43 @@ func completeProfiles(cmd *cobra.Command, args []string, toComplete string) ([]s
 		result = append(result, k)
 	}
 	return result, cobra.ShellCompDirectiveNoFileComp
+}
+
+func completeSyncTargets(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	root := syncPkgbuildDir
+	if root == "" && cmd != nil {
+		if value, err := cmd.Flags().GetString("pkgbuild-dir"); err == nil {
+			root = value
+		}
+	}
+	if root == "" {
+		profile, _, err := Conf.SelectProfile()
+		if err != nil || profile == nil {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		root = profile.PkgBuildDir
+	}
+	if root == "" || !filepath.IsAbs(root) {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	dirs, err := pkgbuild.Scan(root)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+	names := append([]string(nil), dirs...)
+	if state, err := pkgbuild.LoadState(pkgbuild.StatePath(root)); err == nil {
+		for _, entry := range state.Packages {
+			if entry.Pkgbase != "" {
+				names = append(names, entry.Pkgbase)
+			}
+			names = append(names, entry.Pkgnames...)
+		}
+	}
+
+	names = uniqueStrings(names)
+	sort.Strings(names)
+	return filterCompletionResults(names, args, toComplete)
 }
 
 func completeLocalPackageFiles(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {

@@ -5,20 +5,26 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/cassava/repoctl/internal/term"
+	"github.com/cassava/repoctl/pacman"
 	"github.com/cassava/repoctl/pacman/alpm"
 	"github.com/cassava/repoctl/pacman/meta"
 	"github.com/cassava/repoctl/pkgbuild"
 	"github.com/cassava/repoctl/repo"
 	"github.com/goulash/errs"
+	"github.com/goulash/osutil"
 	"github.com/spf13/cobra"
 )
 
@@ -33,6 +39,8 @@ var (
 	syncForce          bool
 	syncFailFast       bool
 	syncPrune          bool
+	syncCleanCache     bool
+	syncJobs           int
 	syncSign           bool
 	syncNoSign         bool
 	syncKey            string
@@ -58,6 +66,8 @@ func init() {
 	syncCmd.Flags().BoolVar(&syncForce, "force", false, "rebuild all selected packages")
 	syncCmd.Flags().BoolVar(&syncFailFast, "fail-fast", false, "stop after the first failure")
 	syncCmd.Flags().BoolVar(&syncPrune, "prune", false, "remove packages that are not produced by any PKGBUILD")
+	syncCmd.Flags().BoolVar(&syncCleanCache, "clean-cache", false, "remove the package cache before syncing")
+	syncCmd.Flags().IntVar(&syncJobs, "jobs", 1, "number of packages to build concurrently")
 	syncCmd.Flags().BoolVar(&syncSign, "sign", false, "sign built packages")
 	syncCmd.Flags().BoolVar(&syncNoSign, "nosign", false, "do not sign built packages")
 	syncCmd.Flags().StringVar(&syncKey, "key", "", "GPG key used for signing")
@@ -103,16 +113,27 @@ var syncCmd = &cobra.Command{
   PKGBUILD. It cannot be combined with filters and is skipped when no
   PKGBUILDs are found. Debug packages named <pkgname>-debug are kept
   when their base package is present in the tree.
+
+  Built packages are cached in .repoctl/cache/ and reused when the same
+  PKGBUILD and build options are needed again, for example after a
+  repository database reset or for another profile. Use --clean-cache to
+  remove the cache. The cache key covers the PKGBUILD fingerprint,
+  signing settings, and makepkg flags; changes to makepkg.conf are not
+  detected, so use --clean-cache after changing it. --jobs builds up to N
+  packages concurrently; running builds are allowed to finish when
+  --fail-fast stops scheduling new ones.
 `,
 	Example: `  repoctl sync
   repoctl sync foo
   repoctl sync --dry-run
   repoctl sync --rebuild-changed
+  repoctl sync --jobs 4
   repoctl sync --prune`,
-	Args:     cobra.ArbitraryArgs,
-	PreRunE:  ProfileInit,
-	PostRunE: ProfileTeardown,
-	RunE:     runSync,
+	Args:              cobra.ArbitraryArgs,
+	ValidArgsFunction: completeSyncTargets,
+	PreRunE:           ProfileInit,
+	PostRunE:          ProfileTeardown,
+	RunE:              runSync,
 }
 
 // syncAction is what sync intends to do with a PKGBUILD directory.
@@ -141,6 +162,8 @@ type syncUnit struct {
 	existing      []string
 	changed       bool
 	pendingChange bool
+	cached        bool
+	cacheDir      string
 }
 
 // managed reports whether the unit can be built and added.
@@ -194,6 +217,12 @@ func runSync(cmd *cobra.Command, filters []string) error {
 	if syncPrune && len(filters) > 0 {
 		return errors.New("--prune cannot be combined with filters")
 	}
+	if syncJobs < 1 {
+		return errors.New("--jobs must be at least 1")
+	}
+	if syncJobs > 1 && (syncSyncdeps || syncRmdeps) {
+		term.Warnf("Warning: --syncdeps and --rmdeps may prompt concurrently with --jobs > 1\n")
+	}
 
 	info, err := os.Stat(root)
 	if err != nil {
@@ -214,6 +243,18 @@ func runSync(cmd *cobra.Command, filters []string) error {
 		return err
 	}
 	defer lock.Close()
+
+	if syncCleanCache {
+		cacheRoot := syncCacheRoot(root)
+		if syncDryRun {
+			term.Printf("Would remove cache: %s\n", cacheRoot)
+		} else {
+			if err := os.RemoveAll(cacheRoot); err != nil {
+				return fmt.Errorf("cannot remove package cache: %w", err)
+			}
+			term.Printf("Removed cache: %s\n", cacheRoot)
+		}
+	}
 
 	statePath := pkgbuild.StatePath(root)
 	state := pkgbuild.NewState()
@@ -242,6 +283,9 @@ func runSync(cmd *cobra.Command, filters []string) error {
 	units := make([]*syncUnit, 0, len(dirs))
 	for _, dir := range dirs {
 		units = append(units, loadSyncUnit(root, dir, state, useCache))
+	}
+	if !syncDryRun {
+		pruneSyncCache(root, units)
 	}
 
 	selected, err := selectSyncUnits(units, filters)
@@ -286,6 +330,26 @@ func runSync(cmd *cobra.Command, filters []string) error {
 		}
 	}
 
+	buildOptions := pkgbuild.BuildOptions{
+		Sign:  syncShouldSign(),
+		Key:   syncKey,
+		Flags: syncMakepkgFlags(),
+	}
+	for _, unit := range selected {
+		if unit.action != syncBuild && unit.action != syncRepair {
+			continue
+		}
+		unit.cacheDir = syncCacheDir(root, unit, buildOptions)
+		if syncForce || syncCleanCache {
+			continue
+		}
+		if paths, ok := syncCachedArtifacts(unit, unit.cacheDir); ok {
+			unit.action = syncAdd
+			unit.existing = paths
+			unit.cached = true
+		}
+	}
+
 	if syncDryRun {
 		counts := printSyncPlan(selected)
 		if syncPrune {
@@ -307,11 +371,8 @@ func runSync(cmd *cobra.Command, filters []string) error {
 	var counts syncCounts
 	built := make(map[*syncUnit]bool)
 	preserve := make(map[*syncUnit]bool)
-	buildOptions := pkgbuild.BuildOptions{
-		Sign:  syncShouldSign(),
-		Key:   syncKey,
-		Flags: syncMakepkgFlags(),
-	}
+	var buildUnits []*syncUnit
+	stopped := false
 
 	for _, unit := range selected {
 		failedBefore := counts.failed
@@ -335,7 +396,7 @@ func runSync(cmd *cobra.Command, filters []string) error {
 				term.Warnf("Warning: %s: PKGBUILD changed but version is unchanged; bump pkgrel or use --rebuild-changed\n", unit.dir)
 			}
 		case syncAdd:
-			term.Printf("  add          %-30s %s\n", unit.dir, unit.metadata.Version)
+			term.Printf("  %-12s %-30s %s\n", syncAddLabel(unit), unit.dir, unit.metadata.Version)
 			if err := addSyncArtifacts(unit.existing); err != nil {
 				counts.failed++
 				term.Errorf("Error: %s: %s\n", unit.dir, err)
@@ -348,20 +409,17 @@ func runSync(cmd *cobra.Command, filters []string) error {
 				label = "repair"
 			}
 			term.Printf("  %-12s %-30s %s\n", label, unit.dir, unit.metadata.Version)
-			built[unit] = true
-			if err := buildSyncUnit(unit, buildOptions); err != nil {
-				counts.failed++
-				term.Errorf("Error: %s: %s\n", unit.dir, err)
-			} else if unit.action == syncRepair {
-				counts.repaired++
-			} else {
-				counts.built++
-			}
+			buildUnits = append(buildUnits, unit)
 		}
 
 		if syncFailFast && counts.failed > failedBefore {
+			stopped = true
 			break
 		}
+	}
+
+	if !stopped {
+		executeSyncBuilds(buildUnits, buildOptions, syncJobs, syncFailFast, &counts, built)
 	}
 
 	if syncPrune && (!syncFailFast || counts.failed == 0) {
@@ -663,25 +721,48 @@ func decideSyncUnit(unit *syncUnit, repoIndex map[string]*meta.Package, options 
 	}
 }
 
-// buildSyncUnit builds one PKGBUILD in a temporary destination and adds
-// the resulting packages to the repository.
-func buildSyncUnit(unit *syncUnit, options pkgbuild.BuildOptions) error {
+// syncBuildResult is the outcome of building one PKGBUILD.
+type syncBuildResult struct {
+	unit    *syncUnit
+	paths   []string
+	warning error
+	tempDir string
+	err     error
+}
+
+// buildSyncArtifacts builds one PKGBUILD, stores the packages in the cache,
+// and returns the temporary directory containing them. The caller must
+// remove tempDir after adding the packages to the repository. Cache
+// failures are returned as warnings.
+func buildSyncArtifacts(unit *syncUnit, options pkgbuild.BuildOptions, cacheDir string) syncBuildResult {
+	result := syncBuildResult{unit: unit}
+
 	pkgdest, err := os.MkdirTemp("", "repoctl-pkgdest-")
 	if err != nil {
-		return err
+		result.err = err
+		return result
 	}
-	defer os.RemoveAll(pkgdest)
+	result.tempDir = pkgdest
 
 	if err := pkgbuild.Build(unit.path, pkgdest, options); err != nil {
-		return err
+		result.err = err
+		os.RemoveAll(pkgdest)
+		result.tempDir = ""
+		return result
 	}
 
 	artifacts, err := pkgbuild.ReadArtifacts(pkgdest)
 	if err != nil {
-		return err
+		result.err = err
+		os.RemoveAll(pkgdest)
+		result.tempDir = ""
+		return result
 	}
 	if len(artifacts) == 0 {
-		return fmt.Errorf("makepkg produced no packages")
+		result.err = fmt.Errorf("makepkg produced no packages")
+		os.RemoveAll(pkgdest)
+		result.tempDir = ""
+		return result
 	}
 
 	// makepkg may have produced a different version than SRCINFO reported
@@ -695,11 +776,106 @@ func buildSyncUnit(unit *syncUnit, options pkgbuild.BuildOptions) error {
 		}
 	}
 
-	paths := make([]string, 0, len(artifacts))
+	result.paths = make([]string, 0, len(artifacts))
 	for _, pkg := range artifacts {
-		paths = append(paths, pkg.Filename)
+		result.paths = append(result.paths, pkg.Filename)
 	}
-	return addSyncArtifacts(paths)
+
+	if err := cacheSyncArtifacts(cacheDir, artifacts); err != nil {
+		result.warning = fmt.Errorf("cannot cache packages: %w", err)
+	}
+	return result
+}
+
+// handleSyncBuildResult adds the packages from a build to the repository.
+func handleSyncBuildResult(result syncBuildResult, counts *syncCounts, built map[*syncUnit]bool) bool {
+	if result.tempDir != "" {
+		defer os.RemoveAll(result.tempDir)
+	}
+
+	built[result.unit] = true
+	if result.warning != nil {
+		term.Warnf("Warning: %s: %s\n", result.unit.dir, result.warning)
+	}
+	if result.err != nil {
+		counts.failed++
+		term.Errorf("Error: %s: %s\n", result.unit.dir, result.err)
+		return true
+	}
+	if err := addSyncArtifacts(result.paths); err != nil {
+		counts.failed++
+		term.Errorf("Error: %s: %s\n", result.unit.dir, err)
+		return true
+	}
+
+	if result.unit.action == syncRepair {
+		counts.repaired++
+	} else {
+		counts.built++
+	}
+	return false
+}
+
+// executeSyncBuilds builds the given units with up to jobs workers and adds
+// each successful result to the repository serially.
+func executeSyncBuilds(units []*syncUnit, options pkgbuild.BuildOptions, jobs int, failFast bool, counts *syncCounts, built map[*syncUnit]bool) {
+	if len(units) == 0 {
+		return
+	}
+
+	if jobs <= 1 {
+		for _, unit := range units {
+			if failFast && counts.failed > 0 {
+				return
+			}
+			result := buildSyncArtifacts(unit, options, unit.cacheDir)
+			handleSyncBuildResult(result, counts, built)
+		}
+		return
+	}
+
+	jobsCh := make(chan *syncUnit)
+	results := make(chan syncBuildResult)
+	stop := make(chan struct{})
+
+	var workers sync.WaitGroup
+	for i := 0; i < jobs; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for unit := range jobsCh {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				results <- buildSyncArtifacts(unit, options, unit.cacheDir)
+			}
+		}()
+	}
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
+
+	go func() {
+		defer close(jobsCh)
+		for _, unit := range units {
+			select {
+			case <-stop:
+				return
+			case jobsCh <- unit:
+			}
+		}
+	}()
+
+	stopped := false
+	for result := range results {
+		if handleSyncBuildResult(result, counts, built) && failFast && !stopped {
+			stopped = true
+			close(stop)
+		}
+	}
 }
 
 // syncShouldSign reports whether makepkg should sign packages.
@@ -751,6 +927,123 @@ func addSyncArtifacts(paths []string) error {
 		addable = append(addable, path)
 	}
 	return Repo.Copy(nil, addable...)
+}
+
+// syncCacheRoot returns the package cache directory.
+func syncCacheRoot(root string) string {
+	return filepath.Join(root, ".repoctl", "cache")
+}
+
+// syncCacheDir returns the cache directory for one PKGBUILD and build
+// context.
+func syncCacheDir(root string, unit *syncUnit, options pkgbuild.BuildOptions) string {
+	fingerprint := strings.TrimPrefix(string(unit.inspection.Fingerprint), "sha256:")
+	return filepath.Join(syncCacheRoot(root), unit.dir, fingerprint+"-"+syncBuildContext(options))
+}
+
+// syncBuildContext returns a short hash of settings that influence the
+// packages that makepkg produces.
+func syncBuildContext(options pkgbuild.BuildOptions) string {
+	hash := sha256.New()
+	fmt.Fprintf(hash, "sign=%t\nkey=%s\narch=%s\n", options.Sign, options.Key, runtime.GOARCH)
+	for _, flag := range options.Flags {
+		fmt.Fprintf(hash, "flag=%s\n", flag)
+	}
+	return hex.EncodeToString(hash.Sum(nil))[:16]
+}
+
+// syncCachedArtifacts returns the package files in cacheDir when they form
+// a complete set for the unit.
+func syncCachedArtifacts(unit *syncUnit, cacheDir string) ([]string, bool) {
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return nil, false
+	}
+
+	found := make(map[string]bool)
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !alpm.HasPackageFormat(entry.Name()) {
+			continue
+		}
+
+		path := filepath.Join(cacheDir, entry.Name())
+		pkg, err := pacman.Read(path)
+		if err != nil {
+			return nil, false
+		}
+		if alpm.VerCmp(pkg.Version, unit.metadata.Version) != 0 {
+			return nil, false
+		}
+		if containsString(unit.metadata.Pkgnames, pkg.Name) {
+			found[pkg.Name] = true
+		}
+		if Repo.RequireSignature {
+			signed, err := repo.NewSignedPkg(path)
+			if err != nil || !signed.HasSignature() {
+				return nil, false
+			}
+		}
+		paths = append(paths, path)
+	}
+
+	for _, name := range unit.metadata.Pkgnames {
+		if !found[name] {
+			return nil, false
+		}
+	}
+	return paths, true
+}
+
+// cacheSyncArtifacts replaces the cache entry for a unit with the given
+// artifacts.
+func cacheSyncArtifacts(cacheDir string, artifacts pacman.Packages) error {
+	if cacheDir == "" || !filepath.IsAbs(cacheDir) {
+		return fmt.Errorf("invalid cache directory %q", cacheDir)
+	}
+	parent := filepath.Dir(cacheDir)
+	if parent == "." || parent == string(filepath.Separator) {
+		return fmt.Errorf("refusing to clear unsafe cache path %q", cacheDir)
+	}
+	if err := os.RemoveAll(parent); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return err
+	}
+
+	for _, pkg := range artifacts {
+		src := pkg.Filename
+		dst := filepath.Join(cacheDir, filepath.Base(src))
+		if err := osutil.CopyFile(src, dst); err != nil {
+			return err
+		}
+		if sig := src + ".sig"; fileExists(sig) {
+			if err := osutil.CopyFile(sig, dst+".sig"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// pruneSyncCache removes cache entries for directories that no longer exist.
+func pruneSyncCache(root string, units []*syncUnit) {
+	cacheRoot := syncCacheRoot(root)
+	entries, err := os.ReadDir(cacheRoot)
+	if err != nil {
+		return
+	}
+
+	keep := make(map[string]bool, len(units))
+	for _, unit := range units {
+		keep[unit.dir] = true
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && !keep[entry.Name()] {
+			os.RemoveAll(filepath.Join(cacheRoot, entry.Name()))
+		}
+	}
 }
 
 // pruneSyncPackages returns repository packages that are not produced by
@@ -848,6 +1141,13 @@ func updateSyncState(state *pkgbuild.State, units []*syncUnit, built, preserve m
 	state.Prune(keep)
 }
 
+func syncAddLabel(unit *syncUnit) string {
+	if unit.cached {
+		return "add (cached)"
+	}
+	return "add"
+}
+
 // printSyncPlan prints what a dry run would do and returns the counts.
 func printSyncPlan(units []*syncUnit) syncCounts {
 	var counts syncCounts
@@ -871,7 +1171,7 @@ func printSyncPlan(units []*syncUnit) syncCounts {
 			}
 		case syncAdd:
 			counts.added++
-			term.Printf("  add          %-30s %s\n", unit.dir, unit.metadata.Version)
+			term.Printf("  %-12s %-30s %s\n", syncAddLabel(unit), unit.dir, unit.metadata.Version)
 		case syncBuild, syncRepair:
 			label := "build"
 			if unit.action == syncRepair {

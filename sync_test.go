@@ -5,8 +5,11 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cassava/repoctl/pacman"
@@ -312,6 +315,190 @@ func TestPruneSyncPackages(t *testing.T) {
 	units = append(units, &syncUnit{dir: "broken"})
 	if _, safe := pruneSyncPackages(units, repository); safe {
 		t.Error("expected pruning to be unsafe when metadata is unavailable")
+	}
+}
+
+func TestSyncCachedArtifacts(t *testing.T) {
+	cacheDir := t.TempDir()
+	writeSyncTestPackage(t, filepath.Join(cacheDir, "foo-1.0-1-any.pkg.tar.gz"), "foo", "1.0-1")
+	writeSyncTestPackage(t, filepath.Join(cacheDir, "foo-debug-1.0-1-any.pkg.tar.gz"), "foo-debug", "1.0-1")
+
+	oldRepo := Repo
+	Repo = &repo.Repo{}
+	t.Cleanup(func() { Repo = oldRepo })
+
+	unit := &syncUnit{metadata: metadata("1.0-1", "foo")}
+	paths, ok := syncCachedArtifacts(unit, cacheDir)
+	if !ok || len(paths) != 2 {
+		t.Fatalf("cache hit = %v with %d paths, want true with 2", ok, len(paths))
+	}
+
+	writeSyncTestPackage(t, filepath.Join(cacheDir, "foo-0.9-1-any.pkg.tar.gz"), "foo", "0.9-1")
+	if _, ok := syncCachedArtifacts(unit, cacheDir); ok {
+		t.Error("cache with a mismatched version was accepted")
+	}
+	os.Remove(filepath.Join(cacheDir, "foo-0.9-1-any.pkg.tar.gz"))
+
+	Repo.RequireSignature = true
+	if _, ok := syncCachedArtifacts(unit, cacheDir); ok {
+		t.Error("unsigned cache was accepted while signatures are required")
+	}
+	for _, name := range []string{"foo-1.0-1-any.pkg.tar.gz", "foo-debug-1.0-1-any.pkg.tar.gz"} {
+		if err := os.WriteFile(filepath.Join(cacheDir, name+".sig"), []byte("sig"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := syncCachedArtifacts(unit, cacheDir); !ok {
+		t.Error("signed cache was rejected")
+	}
+}
+
+func TestCacheSyncArtifacts(t *testing.T) {
+	src := t.TempDir()
+	pkgPath := filepath.Join(src, "foo-1.0-1-any.pkg.tar.gz")
+	writeSyncTestPackage(t, pkgPath, "foo", "1.0-1")
+	if err := os.WriteFile(pkgPath+".sig", []byte("sig"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cacheDir := filepath.Join(t.TempDir(), "cache", "foo", "key")
+	artifacts := pacman.Packages{&pacman.Package{Filename: pkgPath}}
+	if err := cacheSyncArtifacts(cacheDir, artifacts); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{"foo-1.0-1-any.pkg.tar.gz", "foo-1.0-1-any.pkg.tar.gz.sig"} {
+		if !fileExists(filepath.Join(cacheDir, name)) {
+			t.Errorf("cache does not contain %s", name)
+		}
+	}
+
+	stale := filepath.Join(filepath.Dir(cacheDir), "stale.pkg.tar.gz")
+	if err := os.WriteFile(stale, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := cacheSyncArtifacts(cacheDir, artifacts); err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(stale) {
+		t.Error("stale cache entry was not removed")
+	}
+}
+
+func TestBuildSyncArtifactsWithFakeMakepkg(t *testing.T) {
+	src := t.TempDir()
+	pkgPath := filepath.Join(src, "foo-1.0-1-any.pkg.tar.gz")
+	writeSyncTestPackage(t, pkgPath, "foo", "1.0-1")
+
+	binDir := t.TempDir()
+	script := "#!/bin/sh\ncp \"$FAKE_PACKAGE\" \"$PKGDEST/\"\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(binDir, "makepkg"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	t.Setenv("FAKE_PACKAGE", pkgPath)
+
+	pkgDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(pkgDir, "PKGBUILD"), []byte("pkgname=foo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	unit := &syncUnit{
+		dir:      "foo",
+		path:     pkgDir,
+		metadata: metadata("1.0-1", "foo"),
+		cacheDir: filepath.Join(t.TempDir(), "cache", "foo", "key"),
+	}
+
+	result := buildSyncArtifacts(unit, pkgbuild.BuildOptions{}, unit.cacheDir)
+	if result.tempDir != "" {
+		defer os.RemoveAll(result.tempDir)
+	}
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if result.warning != nil {
+		t.Errorf("unexpected cache warning: %v", result.warning)
+	}
+	if len(result.paths) != 1 {
+		t.Fatalf("got %d artifact paths, want 1", len(result.paths))
+	}
+	if !fileExists(filepath.Join(unit.cacheDir, "foo-1.0-1-any.pkg.tar.gz")) {
+		t.Error("artifact was not written to the cache")
+	}
+}
+
+func TestCompleteSyncTargets(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"alpha", "beta"} {
+		path := filepath.Join(root, dir, "PKGBUILD")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("pkgname="+dir+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	state := pkgbuild.NewState()
+	state.Set("gamma", &pkgbuild.StateEntry{
+		Fingerprint: "sha256:abc",
+		Pkgbase:     "gamma",
+		Pkgnames:    []string{"gamma", "gamma-libs"},
+		Version:     "1.0-1",
+	})
+	if err := pkgbuild.SaveState(pkgbuild.StatePath(root), state); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRoot := syncPkgbuildDir
+	syncPkgbuildDir = root
+	t.Cleanup(func() { syncPkgbuildDir = oldRoot })
+
+	got, _ := completeSyncTargets(nil, nil, "")
+	want := []string{"alpha", "beta", "gamma", "gamma-libs"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("completions = %v, want %v", got, want)
+	}
+
+	got, _ = completeSyncTargets(nil, nil, "gam")
+	want = []string{"gamma", "gamma-libs"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("filtered completions = %v, want %v", got, want)
+	}
+}
+
+func writeSyncTestPackage(t *testing.T, path, name, version string) {
+	t.Helper()
+
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	gzipWriter := gzip.NewWriter(file)
+	tarWriter := tar.NewWriter(gzipWriter)
+
+	info := []byte("pkgname = " + name + "\n" +
+		"pkgbase = " + name + "\n" +
+		"pkgver = " + version + "\n" +
+		"arch = any\n")
+	if err := tarWriter.WriteHeader(&tar.Header{
+		Name: ".PKGINFO",
+		Mode: 0o644,
+		Size: int64(len(info)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tarWriter.Write(info); err != nil {
+		t.Fatal(err)
+	}
+	if err := tarWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
