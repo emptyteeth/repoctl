@@ -7,7 +7,10 @@ package aur
 import "testing"
 
 var (
-	exists    = []string{"repoctl", "fairsplit", "moped"}
+	// exists lists packages that are expected to exist on AUR. These tests
+	// query the live AUR service, so only long-lived packages should be
+	// listed here; removed packages otherwise break CI.
+	exists    = []string{"repoctl", "moped"}
 	notExists = []string{"repoctl-34534", "arstaorsf", "911222234"}
 	invalid   = []string{"-", "_", "*", "-1q"}
 	many      = []string{
