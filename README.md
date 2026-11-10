@@ -137,6 +137,7 @@ the environment variable `EDITOR`.
 
        [profiles.default]
            repo = "/home/you/pkgs/sirius.db.tar.zst"
+           pkgbuild_dir = ""
            add_params = []
            rm_params = []
            ignore_aur = []
@@ -175,6 +176,42 @@ Now, we can add and manipulate packages in the specified local repository.
    Deleting: pass-extension-tail-1.2.0-1-any.pkg.tar.zst
    ```
    Yes, package names from your repository are also completed.
+
+### Syncing From PKGBUILDs
+
+If you keep your PKGBUILDs in a directory with one subdirectory per package,
+you can let repoctl build and add everything that changed:
+
+```toml
+[profiles.default]
+repo = "/home/you/pkgs/sirius.db.tar.zst"
+pkgbuild_dir = "/home/you/pkgbuilds"
+```
+
+```console
+$ repoctl sync
+  build        foo       1.3-1
+  skip         bar       2.0-1
+  unsupported  baz-git   dynamic pkgver()
+Summary: 1 built, 0 repaired, 0 added, 1 skipped, 0 warning(s), 1 unsupported, 0 failed
+```
+
+Packages whose version matches the repository are skipped. New packages and
+packages with a different version are built with `makepkg` and added through
+the same code path as `repoctl add`. Packages that define `pkgver()` are
+unsupported and skipped, because their version cannot be determined without
+building them.
+
+Filters may name a directory, a pkgbase, or a pkgname:
+
+```console
+$ repoctl sync foo
+$ repoctl sync bar-extra
+```
+
+The `--pkgbuild-dir` flag overrides the configured directory. State used to
+avoid re-reading unchanged PKGBUILDs is stored in `.repoctl/` inside that
+directory.
 
 ### Managing Updates To Your Packages
 
