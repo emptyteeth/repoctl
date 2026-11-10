@@ -62,8 +62,8 @@ func init() {
 	syncCmd.Flags().BoolVar(&syncDryRun, "dry-run", false, "show what would be done without building or modifying the repository")
 	syncCmd.Flags().BoolVar(&syncNoState, "no-state", false, "do not read or write the state cache")
 	syncCmd.Flags().BoolVar(&syncRefresh, "refresh", false, "ignore cached PKGBUILD metadata for this run")
-	syncCmd.Flags().BoolVar(&syncRebuildChanged, "rebuild-changed", false, "rebuild when the PKGBUILD changed even if the version did not")
-	syncCmd.Flags().BoolVar(&syncForce, "force", false, "rebuild all selected packages")
+	syncCmd.Flags().BoolVar(&syncRebuildChanged, "rebuild-changed", false, "rebuild when the PKGBUILD changed even if the version did not (may invalidate client caches)")
+	syncCmd.Flags().BoolVar(&syncForce, "force", false, "rebuild all selected packages (may invalidate client caches)")
 	syncCmd.Flags().BoolVar(&syncFailFast, "fail-fast", false, "stop after the first failure")
 	syncCmd.Flags().BoolVar(&syncPrune, "prune", false, "remove packages that are not produced by any PKGBUILD")
 	syncCmd.Flags().BoolVar(&syncCleanCache, "clean-cache", false, "remove the package cache before syncing")
@@ -122,6 +122,12 @@ var syncCmd = &cobra.Command{
   detected, so use --clean-cache after changing it. --jobs builds up to N
   packages concurrently; running builds are allowed to finish when
   --fail-fast stops scheduling new ones.
+
+  Rebuilding a package without changing its version, for example with
+  --force or --rebuild-changed, produces different bytes under the same
+  filename. Clients that already cached the old package will see a
+  checksum mismatch until their cache entry is removed. Bump pkgrel or
+  pkgver before distributing a changed package.
 `,
 	Example: `  repoctl sync
   repoctl sync foo

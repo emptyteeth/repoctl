@@ -238,6 +238,12 @@ Useful options:
 - `--jobs N` builds up to N packages concurrently. Running builds finish
   when `--fail-fast` stops scheduling new ones.
 
+Rebuilding a package without changing its version, for example with
+`--force` or `--rebuild-changed`, creates different bytes under the same
+filename. Clients that already cached the old package will see a checksum
+mismatch until their cache entry is removed. Bump `pkgrel` or `pkgver`
+before distributing a changed package.
+
 ### Managing Updates To Your Packages
 
 Of course, the initial compilation and adding of packages isn't the trouble,
