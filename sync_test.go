@@ -17,13 +17,17 @@ import (
 
 func TestDecideSyncUnit(t *testing.T) {
 	tests := []struct {
-		name       string
-		metadata   *pkgbuild.Metadata
-		repository map[string]*meta.Package
-		files      []string
-		allow      bool
-		want       syncAction
-		wantAdd    bool
+		name           string
+		metadata       *pkgbuild.Metadata
+		repository     map[string]*meta.Package
+		files          []string
+		allow          bool
+		changed        bool
+		force          bool
+		rebuildChanged bool
+		want           syncAction
+		wantAdd        bool
+		wantPending    bool
 	}{
 		{
 			name:       "new package",
@@ -51,6 +55,64 @@ func TestDecideSyncUnit(t *testing.T) {
 			},
 			files: []string{"alpha-1.0-1-any.pkg.tar.zst"},
 			want:  syncSkip,
+		},
+		{
+			name:     "force rebuilds up to date package",
+			metadata: metadata("1.0-1", "alpha"),
+			repository: map[string]*meta.Package{
+				"alpha": repoPackage("alpha", "1.0-1", "alpha-1.0-1-any.pkg.tar.zst",
+					repoFile("alpha", "1.0-1", "alpha-1.0-1-any.pkg.tar.zst")),
+			},
+			files: []string{"alpha-1.0-1-any.pkg.tar.zst"},
+			force: true,
+			want:  syncBuild,
+		},
+		{
+			name:     "force does not override downgrade",
+			metadata: metadata("1.0-1", "alpha"),
+			repository: map[string]*meta.Package{
+				"alpha": repoPackage("alpha", "2.0-1", "alpha-2.0-1-any.pkg.tar.zst",
+					repoFile("alpha", "2.0-1", "alpha-2.0-1-any.pkg.tar.zst")),
+			},
+			files: []string{"alpha-2.0-1-any.pkg.tar.zst"},
+			force: true,
+			want:  syncDowngrade,
+		},
+		{
+			name:     "rebuild changed package",
+			metadata: metadata("1.0-1", "alpha"),
+			repository: map[string]*meta.Package{
+				"alpha": repoPackage("alpha", "1.0-1", "alpha-1.0-1-any.pkg.tar.zst",
+					repoFile("alpha", "1.0-1", "alpha-1.0-1-any.pkg.tar.zst")),
+			},
+			files:          []string{"alpha-1.0-1-any.pkg.tar.zst"},
+			changed:        true,
+			rebuildChanged: true,
+			want:           syncBuild,
+		},
+		{
+			name:     "changed package is reported pending",
+			metadata: metadata("1.0-1", "alpha"),
+			repository: map[string]*meta.Package{
+				"alpha": repoPackage("alpha", "1.0-1", "alpha-1.0-1-any.pkg.tar.zst",
+					repoFile("alpha", "1.0-1", "alpha-1.0-1-any.pkg.tar.zst")),
+			},
+			files:       []string{"alpha-1.0-1-any.pkg.tar.zst"},
+			changed:     true,
+			want:        syncSkip,
+			wantPending: true,
+		},
+		{
+			name:     "changed package cannot bypass downgrade protection",
+			metadata: metadata("1.0-1", "alpha"),
+			repository: map[string]*meta.Package{
+				"alpha": repoPackage("alpha", "2.0-1", "alpha-2.0-1-any.pkg.tar.zst",
+					repoFile("alpha", "2.0-1", "alpha-2.0-1-any.pkg.tar.zst")),
+			},
+			files:          []string{"alpha-2.0-1-any.pkg.tar.zst"},
+			changed:        true,
+			rebuildChanged: true,
+			want:           syncDowngrade,
 		},
 		{
 			name:     "missing database artifact",
@@ -135,21 +197,29 @@ func TestDecideSyncUnit(t *testing.T) {
 				}
 			}
 
-			oldRepo, oldAllow := Repo, syncAllowDowngrade
+			oldRepo := Repo
 			Repo = &repo.Repo{Directory: dir}
-			syncAllowDowngrade = test.allow
 			t.Cleanup(func() {
 				Repo = oldRepo
-				syncAllowDowngrade = oldAllow
 			})
 
-			unit := &syncUnit{metadata: test.metadata}
-			decideSyncUnit(unit, test.repository)
+			unit := &syncUnit{
+				metadata: test.metadata,
+				changed:  test.changed,
+			}
+			decideSyncUnit(unit, test.repository, syncOptions{
+				AllowDowngrade: test.allow,
+				Force:          test.force,
+				RebuildChanged: test.rebuildChanged,
+			})
 			if unit.action != test.want {
 				t.Errorf("action = %v, want %v", unit.action, test.want)
 			}
 			if test.wantAdd && len(unit.existing) == 0 {
 				t.Error("expected existing artifacts to be selected")
+			}
+			if unit.pendingChange != test.wantPending {
+				t.Errorf("pendingChange = %v, want %v", unit.pendingChange, test.wantPending)
 			}
 		})
 	}
@@ -216,6 +286,32 @@ func TestSelectSyncUnits(t *testing.T) {
 				t.Errorf("filters %v: got %v, want %v", test.filters, dirs, test.want)
 			}
 		}
+	}
+}
+
+func TestPruneSyncPackages(t *testing.T) {
+	units := []*syncUnit{
+		{dir: "foo", metadata: metadata("1.0-1", "foo")},
+		{dir: "bar", metadata: metadata("1.0-1", "bar", "bar-extra")},
+	}
+	repository := map[string]*meta.Package{
+		"foo":       repoPackage("foo", "1.0-1", "foo-1.0-1-any.pkg.tar.zst"),
+		"foo-debug": repoPackage("foo-debug", "1.0-1", "foo-debug-1.0-1-any.pkg.tar.zst"),
+		"bar-extra": repoPackage("bar-extra", "1.0-1", "bar-extra-1.0-1-any.pkg.tar.zst"),
+		"orphan":    repoPackage("orphan", "1.0-1", "orphan-1.0-1-any.pkg.tar.zst"),
+	}
+
+	names, safe := pruneSyncPackages(units, repository)
+	if !safe {
+		t.Fatal("expected pruning to be safe")
+	}
+	if len(names) != 1 || names[0] != "orphan" {
+		t.Errorf("orphans = %v, want [orphan]", names)
+	}
+
+	units = append(units, &syncUnit{dir: "broken"})
+	if _, safe := pruneSyncPackages(units, repository); safe {
+		t.Error("expected pruning to be unsafe when metadata is unavailable")
 	}
 }
 

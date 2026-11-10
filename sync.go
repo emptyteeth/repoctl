@@ -25,6 +25,23 @@ import (
 var (
 	syncPkgbuildDir    string
 	syncAllowDowngrade bool
+	syncStrict         bool
+	syncDryRun         bool
+	syncNoState        bool
+	syncRefresh        bool
+	syncRebuildChanged bool
+	syncForce          bool
+	syncFailFast       bool
+	syncPrune          bool
+	syncSign           bool
+	syncNoSign         bool
+	syncKey            string
+	syncMakepkgArgs    []string
+	syncCleanbuild     bool
+	syncClean          bool
+	syncSyncdeps       bool
+	syncRmdeps         bool
+	syncNocheck        bool
 )
 
 func init() {
@@ -33,6 +50,23 @@ func init() {
 	syncCmd.Flags().StringVar(&syncPkgbuildDir, "pkgbuild-dir", "", "directory containing one subdirectory per package with a PKGBUILD")
 	syncCmd.RegisterFlagCompletionFunc("pkgbuild-dir", completeDirectory)
 	syncCmd.Flags().BoolVar(&syncAllowDowngrade, "allow-downgrade", false, "allow building packages whose version is lower than the repository version")
+	syncCmd.Flags().BoolVar(&syncStrict, "strict", false, "treat warnings as errors")
+	syncCmd.Flags().BoolVar(&syncDryRun, "dry-run", false, "show what would be done without building or modifying the repository")
+	syncCmd.Flags().BoolVar(&syncNoState, "no-state", false, "do not read or write the state cache")
+	syncCmd.Flags().BoolVar(&syncRefresh, "refresh", false, "ignore cached PKGBUILD metadata for this run")
+	syncCmd.Flags().BoolVar(&syncRebuildChanged, "rebuild-changed", false, "rebuild when the PKGBUILD changed even if the version did not")
+	syncCmd.Flags().BoolVar(&syncForce, "force", false, "rebuild all selected packages")
+	syncCmd.Flags().BoolVar(&syncFailFast, "fail-fast", false, "stop after the first failure")
+	syncCmd.Flags().BoolVar(&syncPrune, "prune", false, "remove packages that are not produced by any PKGBUILD")
+	syncCmd.Flags().BoolVar(&syncSign, "sign", false, "sign built packages")
+	syncCmd.Flags().BoolVar(&syncNoSign, "nosign", false, "do not sign built packages")
+	syncCmd.Flags().StringVar(&syncKey, "key", "", "GPG key used for signing")
+	syncCmd.Flags().StringArrayVar(&syncMakepkgArgs, "makepkg-arg", nil, "additional argument passed to makepkg")
+	syncCmd.Flags().BoolVar(&syncCleanbuild, "cleanbuild", false, "remove $srcdir before building")
+	syncCmd.Flags().BoolVar(&syncClean, "clean", false, "clean up work files after building")
+	syncCmd.Flags().BoolVar(&syncSyncdeps, "syncdeps", false, "install missing dependencies with pacman")
+	syncCmd.Flags().BoolVar(&syncRmdeps, "rmdeps", false, "remove dependencies after building")
+	syncCmd.Flags().BoolVar(&syncNocheck, "nocheck", false, "do not run the check() function")
 }
 
 var syncCmd = &cobra.Command{
@@ -57,10 +91,24 @@ var syncCmd = &cobra.Command{
   Filters may name a directory, a pkgbase, or a pkgname. Matching any of
   them selects the directory, and all split packages produced by that
   directory are managed together.
+
+  State is cached in .repoctl/ inside pkgbuild_dir. Use --no-state to
+  disable it, or --refresh to ignore it once. --rebuild-changed rebuilds
+  a package whose PKGBUILD changed even when its version did not; changes
+  to local source files are not detected by the fingerprint. Because
+  change detection depends on the state cache, --rebuild-changed has no
+  effect together with --no-state.
+
+  --prune removes repository packages that are not produced by any
+  PKGBUILD. It cannot be combined with filters and is skipped when no
+  PKGBUILDs are found. Debug packages named <pkgname>-debug are kept
+  when their base package is present in the tree.
 `,
 	Example: `  repoctl sync
   repoctl sync foo
-  repoctl sync foo bar-libs`,
+  repoctl sync --dry-run
+  repoctl sync --rebuild-changed
+  repoctl sync --prune`,
 	Args:     cobra.ArbitraryArgs,
 	PreRunE:  ProfileInit,
 	PostRunE: ProfileTeardown,
@@ -89,8 +137,10 @@ type syncUnit struct {
 	unsupported string
 	err         error
 
-	action   syncAction
-	existing []string
+	action        syncAction
+	existing      []string
+	changed       bool
+	pendingChange bool
 }
 
 // managed reports whether the unit can be built and added.
@@ -98,11 +148,19 @@ func (u *syncUnit) managed() bool {
 	return u.err == nil && u.unsupported == "" && u.metadata != nil
 }
 
+// syncOptions controls how units are planned.
+type syncOptions struct {
+	AllowDowngrade bool
+	Force          bool
+	RebuildChanged bool
+}
+
 // syncCounts summarizes the result of a sync.
 type syncCounts struct {
 	built       int
 	repaired    int
 	added       int
+	pruned      int
 	skipped     int
 	warnings    int
 	unsupported int
@@ -122,6 +180,19 @@ func runSync(cmd *cobra.Command, filters []string) error {
 	}
 	if err := validateSyncFilters(filters); err != nil {
 		return err
+	}
+
+	if syncSign && syncNoSign {
+		return errors.New("--sign and --nosign cannot be used together")
+	}
+	if syncNoSign && Repo.RequireSignature {
+		return errors.New("the profile requires signatures, so --nosign cannot be used")
+	}
+	if syncKey != "" && !syncShouldSign() {
+		return errors.New("--key requires signing to be enabled")
+	}
+	if syncPrune && len(filters) > 0 {
+		return errors.New("--prune cannot be combined with filters")
 	}
 
 	info, err := os.Stat(root)
@@ -145,10 +216,14 @@ func runSync(cmd *cobra.Command, filters []string) error {
 	defer lock.Close()
 
 	statePath := pkgbuild.StatePath(root)
-	state, err := pkgbuild.LoadState(statePath)
-	if err != nil {
-		term.Warnf("Warning: ignoring state file %s: %s\n", statePath, err)
-		state = pkgbuild.NewState()
+	state := pkgbuild.NewState()
+	if !syncNoState {
+		loaded, err := pkgbuild.LoadState(statePath)
+		if err != nil {
+			term.Warnf("Warning: ignoring state file %s: %s\n", statePath, err)
+		} else {
+			state = loaded
+		}
 	}
 
 	dirs, err := pkgbuild.Scan(root)
@@ -163,9 +238,10 @@ func runSync(cmd *cobra.Command, filters []string) error {
 		return nil
 	}
 
+	useCache := !syncRefresh && !syncNoState
 	units := make([]*syncUnit, 0, len(dirs))
 	for _, dir := range dirs {
-		units = append(units, loadSyncUnit(root, dir, state))
+		units = append(units, loadSyncUnit(root, dir, state, useCache))
 	}
 
 	selected, err := selectSyncUnits(units, filters)
@@ -189,6 +265,12 @@ func runSync(cmd *cobra.Command, filters []string) error {
 		repoIndex[pkg.Name] = pkg
 	}
 
+	options := syncOptions{
+		AllowDowngrade: syncAllowDowngrade,
+		Force:          syncForce,
+		RebuildChanged: syncRebuildChanged,
+	}
+
 	detectSyncDuplicates(selected)
 	for _, unit := range selected {
 		switch {
@@ -200,14 +282,40 @@ func runSync(cmd *cobra.Command, filters []string) error {
 			unit.err = errors.New("package metadata is unavailable")
 			unit.action = syncError
 		default:
-			decideSyncUnit(unit, repoIndex)
+			decideSyncUnit(unit, repoIndex, options)
 		}
+	}
+
+	if syncDryRun {
+		counts := printSyncPlan(selected)
+		if syncPrune {
+			names, safe := pruneSyncPackages(units, repoIndex)
+			if !safe {
+				counts.warnings++
+				term.Warnf("Warning: cannot determine orphan packages because some PKGBUILDs could not be read\n")
+			} else {
+				for _, name := range names {
+					term.Printf("  prune        %s\n", name)
+					counts.pruned++
+				}
+			}
+		}
+		printSyncSummary(counts, true)
+		return syncExitError(counts)
 	}
 
 	var counts syncCounts
 	built := make(map[*syncUnit]bool)
+	preserve := make(map[*syncUnit]bool)
+	buildOptions := pkgbuild.BuildOptions{
+		Sign:  syncShouldSign(),
+		Key:   syncKey,
+		Flags: syncMakepkgFlags(),
+	}
 
 	for _, unit := range selected {
+		failedBefore := counts.failed
+
 		switch unit.action {
 		case syncError:
 			counts.failed++
@@ -221,6 +329,11 @@ func runSync(cmd *cobra.Command, filters []string) error {
 		case syncSkip:
 			counts.skipped++
 			term.Printf("  skip         %-30s %s\n", unit.dir, unit.metadata.Version)
+			if unit.pendingChange {
+				counts.warnings++
+				preserve[unit] = true
+				term.Warnf("Warning: %s: PKGBUILD changed but version is unchanged; bump pkgrel or use --rebuild-changed\n", unit.dir)
+			}
 		case syncAdd:
 			term.Printf("  add          %-30s %s\n", unit.dir, unit.metadata.Version)
 			if err := addSyncArtifacts(unit.existing); err != nil {
@@ -236,7 +349,7 @@ func runSync(cmd *cobra.Command, filters []string) error {
 			}
 			term.Printf("  %-12s %-30s %s\n", label, unit.dir, unit.metadata.Version)
 			built[unit] = true
-			if err := buildSyncUnit(unit); err != nil {
+			if err := buildSyncUnit(unit, buildOptions); err != nil {
 				counts.failed++
 				term.Errorf("Error: %s: %s\n", unit.dir, err)
 			} else if unit.action == syncRepair {
@@ -245,23 +358,48 @@ func runSync(cmd *cobra.Command, filters []string) error {
 				counts.built++
 			}
 		}
+
+		if syncFailFast && counts.failed > failedBefore {
+			break
+		}
 	}
 
-	updateSyncState(state, units, built)
-	if err := pkgbuild.SaveState(statePath, state); err != nil {
-		term.Warnf("Warning: cannot save state file %s: %s\n", statePath, err)
+	if syncPrune && (!syncFailFast || counts.failed == 0) {
+		names, safe := pruneSyncPackages(units, repoIndex)
+		if !safe {
+			counts.warnings++
+			term.Warnf("Warning: cannot determine orphan packages because some PKGBUILDs could not be read\n")
+		} else {
+			for _, name := range names {
+				term.Printf("  prune        %s\n", name)
+				failedBefore := counts.failed
+				if err := pruneSyncPackage(name, repoIndex[name]); err != nil {
+					counts.failed++
+					term.Errorf("Error: cannot prune %s: %s\n", name, err)
+				} else {
+					counts.pruned++
+				}
+				if syncFailFast && counts.failed > failedBefore {
+					break
+				}
+			}
+		}
 	}
 
-	printSyncSummary(counts)
-	if counts.failed > 0 {
-		return fmt.Errorf("%d package(s) failed", counts.failed)
+	if !syncNoState {
+		updateSyncState(state, units, built, preserve)
+		if err := pkgbuild.SaveState(statePath, state); err != nil {
+			term.Warnf("Warning: cannot save state file %s: %s\n", statePath, err)
+		}
 	}
-	return nil
+
+	printSyncSummary(counts, false)
+	return syncExitError(counts)
 }
 
 // loadSyncUnit reads the metadata for one PKGBUILD directory, using the
 // cached state entry when its fingerprint still matches.
-func loadSyncUnit(root, dir string, state *pkgbuild.State) *syncUnit {
+func loadSyncUnit(root, dir string, state *pkgbuild.State, useCache bool) *syncUnit {
 	unit := &syncUnit{
 		dir:  dir,
 		path: filepath.Join(root, dir),
@@ -274,7 +412,17 @@ func loadSyncUnit(root, dir string, state *pkgbuild.State) *syncUnit {
 	}
 	unit.inspection = inspection
 
-	entry, cached := state.Entry(dir, inspection.Fingerprint)
+	if previous := state.Packages[dir]; previous != nil && previous.Fingerprint != inspection.Fingerprint {
+		unit.changed = true
+	}
+
+	var (
+		entry  *pkgbuild.StateEntry
+		cached bool
+	)
+	if useCache {
+		entry, cached = state.Entry(dir, inspection.Fingerprint)
+	}
 
 	if inspection.Dynamic {
 		unit.unsupported = inspection.DynamicReason
@@ -416,7 +564,7 @@ func detectSyncDuplicates(units []*syncUnit) {
 
 // decideSyncUnit compares the candidate version with the repository and
 // decides what to do with the whole PKGBUILD directory.
-func decideSyncUnit(unit *syncUnit, repoIndex map[string]*meta.Package) {
+func decideSyncUnit(unit *syncUnit, repoIndex map[string]*meta.Package, options syncOptions) {
 	var (
 		needBuild      bool
 		needAdd        bool
@@ -473,7 +621,7 @@ func decideSyncUnit(unit *syncUnit, repoIndex map[string]*meta.Package) {
 			}
 		default:
 			// The candidate is older than the version in the repository.
-			if syncAllowDowngrade {
+			if options.AllowDowngrade {
 				if existingPath != "" {
 					needAdd = true
 					existing = append(existing, existingPath)
@@ -504,20 +652,27 @@ func decideSyncUnit(unit *syncUnit, repoIndex map[string]*meta.Package) {
 	default:
 		unit.action = syncSkip
 	}
+
+	switch {
+	case options.Force && unit.action != syncDowngrade:
+		unit.action = syncBuild
+	case options.RebuildChanged && unit.action == syncSkip && unit.changed:
+		unit.action = syncBuild
+	case unit.action == syncSkip && unit.changed:
+		unit.pendingChange = true
+	}
 }
 
 // buildSyncUnit builds one PKGBUILD in a temporary destination and adds
 // the resulting packages to the repository.
-func buildSyncUnit(unit *syncUnit) error {
+func buildSyncUnit(unit *syncUnit, options pkgbuild.BuildOptions) error {
 	pkgdest, err := os.MkdirTemp("", "repoctl-pkgdest-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(pkgdest)
 
-	if err := pkgbuild.Build(unit.path, pkgdest, pkgbuild.BuildOptions{
-		Sign: Repo.RequireSignature,
-	}); err != nil {
+	if err := pkgbuild.Build(unit.path, pkgdest, options); err != nil {
 		return err
 	}
 
@@ -547,6 +702,35 @@ func buildSyncUnit(unit *syncUnit) error {
 	return addSyncArtifacts(paths)
 }
 
+// syncShouldSign reports whether makepkg should sign packages.
+func syncShouldSign() bool {
+	if syncNoSign {
+		return false
+	}
+	return syncSign || Repo.RequireSignature
+}
+
+// syncMakepkgFlags returns the makepkg flags derived from the command line.
+func syncMakepkgFlags() []string {
+	var flags []string
+	if syncCleanbuild {
+		flags = append(flags, "--cleanbuild")
+	}
+	if syncClean {
+		flags = append(flags, "--clean")
+	}
+	if syncSyncdeps {
+		flags = append(flags, "--syncdeps")
+	}
+	if syncRmdeps {
+		flags = append(flags, "--rmdeps")
+	}
+	if syncNocheck {
+		flags = append(flags, "--nocheck")
+	}
+	return append(flags, syncMakepkgArgs...)
+}
+
 // addSyncArtifacts registers the given package files in the repository.
 func addSyncArtifacts(paths []string) error {
 	if len(paths) == 0 {
@@ -569,12 +753,67 @@ func addSyncArtifacts(paths []string) error {
 	return Repo.Copy(nil, addable...)
 }
 
+// pruneSyncPackages returns repository packages that are not produced by
+// any PKGBUILD. The second return value is false when the set of packages
+// produced by the PKGBUILD directory cannot be determined.
+func pruneSyncPackages(units []*syncUnit, repoIndex map[string]*meta.Package) ([]string, bool) {
+	known := make(map[string]bool)
+	for _, unit := range units {
+		if unit.metadata == nil {
+			return nil, false
+		}
+		for _, name := range unit.metadata.Pkgnames {
+			known[name] = true
+		}
+	}
+
+	// makepkg may produce debug packages that are not listed in pkgname.
+	// Keep them when their base package is present in the PKGBUILD tree.
+	for name := range known {
+		known[name+"-debug"] = true
+	}
+
+	var names []string
+	for name := range repoIndex {
+		if !known[name] {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names, true
+}
+
+// pruneSyncPackage removes one package from the repository.
+func pruneSyncPackage(name string, pkg *meta.Package) error {
+	if pkg == nil {
+		return Repo.RemoveFromDatabase(name)
+	}
+	if pkg.Database == nil {
+		// Only package files are present; remove them according to the
+		// configured backup policy.
+		paths := make([]string, 0, len(pkg.Files))
+		for _, file := range pkg.Files {
+			paths = append(paths, repoFileNamePath(file.Filename))
+		}
+		return Repo.Dispatch(nil, paths...)
+	}
+	if len(pkg.Files) > 0 {
+		return Repo.Remove(nil, name)
+	}
+	return Repo.RemoveFromDatabase(name)
+}
+
 // updateSyncState stores the metadata cache for all scanned directories.
-func updateSyncState(state *pkgbuild.State, units []*syncUnit, built map[*syncUnit]bool) {
+func updateSyncState(state *pkgbuild.State, units []*syncUnit, built, preserve map[*syncUnit]bool) {
 	keep := make(map[string]bool, len(units))
 	for _, unit := range units {
 		keep[unit.dir] = true
 
+		if preserve[unit] {
+			// Keep the previous entry so that a changed but unbuilt
+			// PKGBUILD is detected again on the next run.
+			continue
+		}
 		if unit.inspection == nil {
 			// Keep the previous entry when the PKGBUILD could not be read.
 			continue
@@ -609,16 +848,69 @@ func updateSyncState(state *pkgbuild.State, units []*syncUnit, built map[*syncUn
 	state.Prune(keep)
 }
 
-func printSyncSummary(counts syncCounts) {
-	total := counts.built + counts.repaired + counts.added + counts.skipped +
-		counts.warnings + counts.unsupported + counts.failed
+// printSyncPlan prints what a dry run would do and returns the counts.
+func printSyncPlan(units []*syncUnit) syncCounts {
+	var counts syncCounts
+	for _, unit := range units {
+		switch unit.action {
+		case syncError:
+			counts.failed++
+			term.Errorf("Error: %s: %s\n", unit.dir, unit.err)
+		case syncUnsupported:
+			counts.unsupported++
+			term.Printf("  unsupported  %-30s %s\n", unit.dir, unit.unsupported)
+		case syncDowngrade:
+			counts.warnings++
+			term.Warnf("Warning: %s: version %s is lower than the repository version; use --allow-downgrade\n", unit.dir, unit.metadata.Version)
+		case syncSkip:
+			counts.skipped++
+			term.Printf("  skip         %-30s %s\n", unit.dir, unit.metadata.Version)
+			if unit.pendingChange {
+				counts.warnings++
+				term.Warnf("Warning: %s: PKGBUILD changed but version is unchanged; bump pkgrel or use --rebuild-changed\n", unit.dir)
+			}
+		case syncAdd:
+			counts.added++
+			term.Printf("  add          %-30s %s\n", unit.dir, unit.metadata.Version)
+		case syncBuild, syncRepair:
+			label := "build"
+			if unit.action == syncRepair {
+				label = "repair"
+				counts.repaired++
+			} else {
+				counts.built++
+			}
+			term.Printf("  %-12s %-30s %s\n", label, unit.dir, unit.metadata.Version)
+		}
+	}
+	return counts
+}
+
+func printSyncSummary(counts syncCounts, plan bool) {
+	total := counts.built + counts.repaired + counts.added + counts.pruned +
+		counts.skipped + counts.warnings + counts.unsupported + counts.failed
 	if total == 0 {
 		term.Printf("Nothing to do.\n")
 		return
 	}
-	term.Printf("Summary: %d built, %d repaired, %d added, %d skipped, %d warning(s), %d unsupported, %d failed\n",
-		counts.built, counts.repaired, counts.added, counts.skipped,
-		counts.warnings, counts.unsupported, counts.failed)
+
+	label := "Summary"
+	if plan {
+		label = "Plan"
+	}
+	term.Printf("%s: %d built, %d repaired, %d added, %d pruned, %d skipped, %d warning(s), %d unsupported, %d failed\n",
+		label, counts.built, counts.repaired, counts.added, counts.pruned,
+		counts.skipped, counts.warnings, counts.unsupported, counts.failed)
+}
+
+func syncExitError(counts syncCounts) error {
+	if counts.failed > 0 {
+		return fmt.Errorf("%d package(s) failed", counts.failed)
+	}
+	if syncStrict && counts.warnings > 0 {
+		return fmt.Errorf("%d warning(s) treated as errors", counts.warnings)
+	}
+	return nil
 }
 
 func repoFileNamePath(filename string) string {
