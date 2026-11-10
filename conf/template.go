@@ -22,6 +22,7 @@ var PropertiesTmpl = template.Must(template.New("properties").Funcs(template.Fun
     {{ range $key, $value := .Profiles }}
     [profiles.{{  $key }}]
         repo = {{ printt $value.Repository }}
+        pkgbuild_dir = {{ printt $value.PkgBuildDir }}
         add_params = {{ printt $value.AddParameters }}
         rm_params = {{ printt $value.RemoveParameters }}
         ignore_aur = {{ printt $value.IgnoreAUR }}
@@ -58,6 +59,11 @@ default_profile = {{ printt .DefaultProfile }}
   # The packages that belong to the repository are assumed to lie in the
   # same folder.
   repo = {{ printt $value.Repository }}
+
+  # pkgbuild_dir is the directory that contains one subdirectory per
+  # package, each with a PKGBUILD file. The sync command builds packages
+  # from this directory when their versions differ from the repository.
+  pkgbuild_dir = {{ printt $value.PkgBuildDir }}
 
   # add_params is the set of parameters that will be passed to repo-add
   # when it is called. Specify one time for each parameter.

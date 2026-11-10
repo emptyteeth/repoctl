@@ -23,6 +23,11 @@ type Profile struct {
 	database   string
 	repodir    string
 
+	// PkgBuildDir is the directory that contains one subdirectory per
+	// package, each with a PKGBUILD file. The sync command uses it as the
+	// source of packages for the repository.
+	PkgBuildDir string `toml:"pkgbuild_dir"`
+
 	// AddParameters are parameters to add to the repo-add command line.
 	AddParameters []string `toml:"add_params"`
 	// RemoveParameters are parameters to add to the repo-remove command line.
