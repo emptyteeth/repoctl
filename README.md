@@ -193,7 +193,7 @@ $ repoctl sync
   build        foo       1.3-1
   skip         bar       2.0-1
   unsupported  baz-git   dynamic pkgver()
-Summary: 1 built, 0 repaired, 0 added, 1 skipped, 0 warning(s), 1 unsupported, 0 failed
+Summary: 1 built, 0 repaired, 0 added, 0 pruned, 1 skipped, 0 warning(s), 1 unsupported, 0 failed
 ```
 
 Packages whose version matches the repository are skipped. New packages and
@@ -212,6 +212,21 @@ $ repoctl sync bar-extra
 The `--pkgbuild-dir` flag overrides the configured directory. State used to
 avoid re-reading unchanged PKGBUILDs is stored in `.repoctl/` inside that
 directory.
+
+Useful options:
+
+- `--dry-run` shows the plan without building or modifying the repository.
+- `--rebuild-changed` rebuilds when a PKGBUILD changed even if its version
+  did not. `--force` rebuilds everything selected.
+- `--no-state` disables the metadata cache and `--refresh` ignores it once.
+- `--strict` makes warnings, such as a blocked downgrade, fatal.
+- `--fail-fast` stops after the first failure.
+- `--prune` removes repository packages that are not produced by any
+  PKGBUILD. It cannot be combined with filters.
+- makepkg options can be forwarded with `--cleanbuild`, `--clean`,
+  `--syncdeps`, `--rmdeps`, `--nocheck`, and `--makepkg-arg`.
+- `--sign`, `--nosign`, and `--key` control package signing. Signing is
+  enabled automatically when the profile sets `require_signature`.
 
 ### Managing Updates To Your Packages
 
