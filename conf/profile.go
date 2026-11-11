@@ -28,6 +28,10 @@ type Profile struct {
 	// source of packages for the repository.
 	PkgBuildDir string `toml:"pkgbuild_dir"`
 
+	// UseCache enables caching of built package files in .repoctl/cache/.
+	// It is disabled by default.
+	UseCache bool `toml:"use_cache"`
+
 	// AddParameters are parameters to add to the repo-add command line.
 	AddParameters []string `toml:"add_params"`
 	// RemoveParameters are parameters to add to the repo-remove command line.

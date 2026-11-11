@@ -23,6 +23,7 @@ var PropertiesTmpl = template.Must(template.New("properties").Funcs(template.Fun
     [profiles.{{  $key }}]
         repo = {{ printt $value.Repository }}
         pkgbuild_dir = {{ printt $value.PkgBuildDir }}
+        use_cache = {{ printt $value.UseCache }}
         add_params = {{ printt $value.AddParameters }}
         rm_params = {{ printt $value.RemoveParameters }}
         ignore_aur = {{ printt $value.IgnoreAUR }}
@@ -64,6 +65,11 @@ default_profile = {{ printt .DefaultProfile }}
   # package, each with a PKGBUILD file. The sync command builds packages
   # from this directory when their versions differ from the repository.
   pkgbuild_dir = {{ printt $value.PkgBuildDir }}
+
+  # use_cache enables caching of built package files in .repoctl/cache/.
+  # The cache is disabled by default. Use "repoctl sync --clean-cache" to
+  # remove an existing cache.
+  use_cache = {{ printt $value.UseCache }}
 
   # add_params is the set of parameters that will be passed to repo-add
   # when it is called. Specify one time for each parameter.
