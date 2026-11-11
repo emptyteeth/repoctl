@@ -105,6 +105,9 @@ Before we can actually start managing a local repository, repoctl needs to
 know where it is. No one really enjoys working with configuration files,
 so repoctl will help you out a little here.
 
+A complete annotated example configuration is available in
+[`config.toml.example`](config.toml.example).
+
 1. Create a new configuration, with our repo in `~/pkgs`:
    ```console
    $ repoctl conf new ~/pkgs/sirius.db.tar.zst

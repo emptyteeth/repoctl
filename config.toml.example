@@ -1,0 +1,106 @@
+# Complete example configuration for repoctl.
+#
+# Copy this file to one of the locations repoctl searches:
+#
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/repoctl/config.toml
+#   /etc/xdg/repoctl/config.toml
+#
+# or point REPOCTL_CONFIG at it. Command-line options override values from
+# this file.
+#
+# The paths below are examples; replace them with paths on your system. The
+# repository path must be absolute and points at the database file. Package
+# files are expected to live in the same directory.
+
+# columnate prints "list" results in columns instead of one per line.
+columnate = false
+
+# color controls colored output: "auto", "always", or "never".
+color = "auto"
+
+# quiet reduces informational output.
+quiet = false
+
+# default_profile selects the profile used when --profile is not given.
+default_profile = "default"
+
+
+# ---------------------------------------------------------------------------
+# Development profile: unsigned packages, no artifact cache, sources left in
+# place next to the PKGBUILDs.
+# ---------------------------------------------------------------------------
+[profiles.default]
+  # repo is the absolute path to the repository database. Package files are
+  # stored in the same directory.
+  repo = "/home/you/pkgs/sirius.db.tar.zst"
+
+  # pkgbuild_dir contains one subdirectory per package, each with a PKGBUILD.
+  # It is used by "repoctl sync".
+  pkgbuild_dir = "/home/you/pkgbuilds"
+
+  # use_cache caches built package files in .repoctl/cache/ and reuses them
+  # when the PKGBUILD and build options match. Disabled by default.
+  use_cache = false
+
+  # clean_src downloads sources into a temporary SRCDEST directory and
+  # removes it after each build, keeping downloaded sources out of the
+  # PKGBUILD directories. Disabled by default.
+  clean_src = false
+
+  # add_params and rm_params are extra arguments for repo-add and
+  # repo-remove. To sign the database, use for example:
+  #   add_params = ["--sign", "--key", "YOUR_GPG_KEY_ID"]
+  #   rm_params = ["--sign", "--key", "YOUR_GPG_KEY_ID"]
+  add_params = []
+  rm_params = []
+
+  # ignore_aur lists packages ignored by AUR-related commands.
+  ignore_aur = []
+
+  # require_signature requires a .sig file for every package added to the
+  # repository and makes "sync" pass --sign to makepkg. Disabled by default.
+  require_signature = false
+
+  # backup keeps obsolete package files instead of deleting them.
+  backup = false
+
+  # backup_dir is where obsolete files are moved when backup is true. A
+  # relative path is interpreted relative to the repository directory. If it
+  # resolves to the repository directory itself, obsolete files are left in
+  # place.
+  backup_dir = "backup/"
+
+  # interactive is reserved for prompting before destructive actions. It is
+  # currently not enforced by repoctl.
+  interactive = false
+
+  # pre_action and post_action are shell commands run around repository
+  # operations. They can be used to mount or unmount a remote filesystem.
+  pre_action = ""
+  post_action = ""
+
+
+# ---------------------------------------------------------------------------
+# Release profile: signed packages and database, backups and caching enabled.
+# Select it with "repoctl --profile release ...".
+# ---------------------------------------------------------------------------
+[profiles.release]
+  repo = "/home/you/public/pkgs/sirius-release.db.tar.zst"
+  pkgbuild_dir = "/home/you/pkgbuilds"
+
+  use_cache = true
+  clean_src = true
+
+  # Sign the database with repo-add and repo-remove. Replace the key ID.
+  add_params = ["--sign", "--key", "YOUR_GPG_KEY_ID"]
+  rm_params = ["--sign", "--key", "YOUR_GPG_KEY_ID"]
+
+  ignore_aur = []
+  require_signature = true
+
+  backup = true
+  backup_dir = "/home/you/public/pkgs/backup/"
+
+  interactive = false
+  pre_action = ""
+  post_action = ""
