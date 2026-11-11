@@ -24,6 +24,9 @@ type BuildOptions struct {
 	Key string
 	// Flags are additional arguments passed to makepkg.
 	Flags []string
+	// SrcDest sets SRCDEST for this build. An empty value leaves the
+	// environment and makepkg.conf setting unchanged.
+	SrcDest string
 }
 
 // Build runs makepkg in dir with packages written to pkgdest.
@@ -42,7 +45,11 @@ func Build(dir, pkgdest string, opts BuildOptions) error {
 
 	cmd := exec.Command("makepkg", args...)
 	cmd.Dir = dir
-	cmd.Env = envWith("PKGDEST", pkgdest)
+	if opts.SrcDest != "" {
+		cmd.Env = envWith("PKGDEST", pkgdest, "SRCDEST", opts.SrcDest)
+	} else {
+		cmd.Env = envWith("PKGDEST", pkgdest)
+	}
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -53,18 +60,30 @@ func Build(dir, pkgdest string, opts BuildOptions) error {
 	return nil
 }
 
-// envWith returns the current environment with key set to value.
-func envWith(key, value string) []string {
-	prefix := key + "="
+// envWith returns the current environment with the given KEY=VALUE pairs
+// overridden. Existing entries for the same keys are removed.
+func envWith(pairs ...string) []string {
+	overrides := make(map[string]bool, len(pairs)/2)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		overrides[pairs[i]] = true
+	}
+
 	env := os.Environ()
-	filtered := make([]string, 0, len(env)+1)
+	filtered := make([]string, 0, len(env)+len(overrides))
 	for _, kv := range env {
-		if strings.HasPrefix(kv, prefix) {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		if overrides[key] {
 			continue
 		}
 		filtered = append(filtered, kv)
 	}
-	return append(filtered, prefix+value)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		filtered = append(filtered, pairs[i]+"="+pairs[i+1])
+	}
+	return filtered
 }
 
 // ReadArtifacts reads all package files that makepkg produced in dir.

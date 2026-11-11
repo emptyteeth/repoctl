@@ -124,6 +124,9 @@ var syncCmd = &cobra.Command{
   --jobs builds up to N packages concurrently; running builds are allowed
   to finish when --fail-fast stops scheduling new ones.
 
+  When the profile sets clean_src = true, makepkg downloads sources into a
+  temporary SRCDEST directory that is removed after each build.
+
   Rebuilding a package without changing its version, for example with
   --force or --rebuild-changed, produces different bytes under the same
   filename. Clients that already cached the old package will see a
@@ -288,6 +291,7 @@ func runSync(cmd *cobra.Command, filters []string) error {
 
 	useStateCache := !syncRefresh && !syncNoState
 	cacheEnabled := Profile != nil && Profile.UseCache
+	cleanSrc := Profile != nil && Profile.CleanSrc
 	units := make([]*syncUnit, 0, len(dirs))
 	for _, dir := range dirs {
 		units = append(units, loadSyncUnit(root, dir, state, useStateCache))
@@ -429,7 +433,7 @@ func runSync(cmd *cobra.Command, filters []string) error {
 	}
 
 	if !stopped {
-		executeSyncBuilds(buildUnits, buildOptions, syncJobs, syncFailFast, &counts, built)
+		executeSyncBuilds(buildUnits, buildOptions, syncJobs, syncFailFast, cleanSrc, &counts, built)
 	}
 
 	if syncPrune && (!syncFailFast || counts.failed == 0) {
@@ -744,7 +748,7 @@ type syncBuildResult struct {
 // and returns the temporary directory containing them. The caller must
 // remove tempDir after adding the packages to the repository. Cache
 // failures are returned as warnings.
-func buildSyncArtifacts(unit *syncUnit, options pkgbuild.BuildOptions, cacheDir string) syncBuildResult {
+func buildSyncArtifacts(unit *syncUnit, options pkgbuild.BuildOptions, cacheDir string, cleanSrc bool) syncBuildResult {
 	result := syncBuildResult{unit: unit}
 
 	pkgdest, err := os.MkdirTemp("", "repoctl-pkgdest-")
@@ -753,6 +757,18 @@ func buildSyncArtifacts(unit *syncUnit, options pkgbuild.BuildOptions, cacheDir 
 		return result
 	}
 	result.tempDir = pkgdest
+
+	if cleanSrc {
+		srcDest, err := os.MkdirTemp("", "repoctl-srcdest-")
+		if err != nil {
+			result.err = err
+			os.RemoveAll(pkgdest)
+			result.tempDir = ""
+			return result
+		}
+		defer os.RemoveAll(srcDest)
+		options.SrcDest = srcDest
+	}
 
 	if err := pkgbuild.Build(unit.path, pkgdest, options); err != nil {
 		result.err = err
@@ -830,7 +846,7 @@ func handleSyncBuildResult(result syncBuildResult, counts *syncCounts, built map
 
 // executeSyncBuilds builds the given units with up to jobs workers and adds
 // each successful result to the repository serially.
-func executeSyncBuilds(units []*syncUnit, options pkgbuild.BuildOptions, jobs int, failFast bool, counts *syncCounts, built map[*syncUnit]bool) {
+func executeSyncBuilds(units []*syncUnit, options pkgbuild.BuildOptions, jobs int, failFast, cleanSrc bool, counts *syncCounts, built map[*syncUnit]bool) {
 	if len(units) == 0 {
 		return
 	}
@@ -840,7 +856,7 @@ func executeSyncBuilds(units []*syncUnit, options pkgbuild.BuildOptions, jobs in
 			if failFast && counts.failed > 0 {
 				return
 			}
-			result := buildSyncArtifacts(unit, options, unit.cacheDir)
+			result := buildSyncArtifacts(unit, options, unit.cacheDir, cleanSrc)
 			handleSyncBuildResult(result, counts, built)
 		}
 		return
@@ -861,7 +877,7 @@ func executeSyncBuilds(units []*syncUnit, options pkgbuild.BuildOptions, jobs in
 					return
 				default:
 				}
-				results <- buildSyncArtifacts(unit, options, unit.cacheDir)
+				results <- buildSyncArtifacts(unit, options, unit.cacheDir, cleanSrc)
 			}
 		}()
 	}

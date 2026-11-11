@@ -391,12 +391,21 @@ func TestBuildSyncArtifactsWithFakeMakepkg(t *testing.T) {
 	writeSyncTestPackage(t, pkgPath, "foo", "1.0-1")
 
 	binDir := t.TempDir()
-	script := "#!/bin/sh\ncp \"$FAKE_PACKAGE\" \"$PKGDEST/\"\nexit 0\n"
+	script := `#!/bin/sh
+if [ -n "$SRCDEST" ] && [ -n "$FAKE_SRCDEST_PATH" ]; then
+  echo "$SRCDEST" > "$FAKE_SRCDEST_PATH"
+  echo source > "$SRCDEST/source.tar.gz"
+fi
+cp "$FAKE_PACKAGE" "$PKGDEST/"
+exit 0
+`
 	if err := os.WriteFile(filepath.Join(binDir, "makepkg"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 	t.Setenv("FAKE_PACKAGE", pkgPath)
+	srcDestPathFile := filepath.Join(t.TempDir(), "srcdest-path")
+	t.Setenv("FAKE_SRCDEST_PATH", srcDestPathFile)
 
 	pkgDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(pkgDir, "PKGBUILD"), []byte("pkgname=foo\n"), 0o644); err != nil {
@@ -410,7 +419,7 @@ func TestBuildSyncArtifactsWithFakeMakepkg(t *testing.T) {
 		cacheDir: filepath.Join(t.TempDir(), "cache", "foo", "key"),
 	}
 
-	result := buildSyncArtifacts(unit, pkgbuild.BuildOptions{}, unit.cacheDir)
+	result := buildSyncArtifacts(unit, pkgbuild.BuildOptions{}, unit.cacheDir, false)
 	if result.tempDir != "" {
 		defer os.RemoveAll(result.tempDir)
 	}
@@ -429,7 +438,7 @@ func TestBuildSyncArtifactsWithFakeMakepkg(t *testing.T) {
 
 	// An empty cache directory means caching is disabled; the build must
 	// still succeed without attempting to write a cache.
-	withoutCache := buildSyncArtifacts(unit, pkgbuild.BuildOptions{}, "")
+	withoutCache := buildSyncArtifacts(unit, pkgbuild.BuildOptions{}, "", false)
 	if withoutCache.tempDir != "" {
 		defer os.RemoveAll(withoutCache.tempDir)
 	}
@@ -441,6 +450,30 @@ func TestBuildSyncArtifactsWithFakeMakepkg(t *testing.T) {
 	}
 	if len(withoutCache.paths) != 1 {
 		t.Fatalf("got %d artifact paths without cache, want 1", len(withoutCache.paths))
+	}
+
+	// cleanSrc must point SRCDEST at a temporary directory and remove it
+	// before returning.
+	cleaned := buildSyncArtifacts(unit, pkgbuild.BuildOptions{}, "", true)
+	if cleaned.tempDir != "" {
+		defer os.RemoveAll(cleaned.tempDir)
+	}
+	if cleaned.err != nil {
+		t.Fatal(cleaned.err)
+	}
+	if cleaned.warning != nil {
+		t.Errorf("unexpected warning with clean_src: %v", cleaned.warning)
+	}
+	data, err := os.ReadFile(srcDestPathFile)
+	if err != nil {
+		t.Fatalf("fake makepkg did not record SRCDEST: %v", err)
+	}
+	srcDest := strings.TrimSpace(string(data))
+	if srcDest == "" {
+		t.Fatal("fake makepkg recorded an empty SRCDEST")
+	}
+	if fileExists(srcDest) {
+		t.Errorf("temporary SRCDEST %s was not removed", srcDest)
 	}
 }
 

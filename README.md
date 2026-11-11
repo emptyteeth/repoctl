@@ -139,6 +139,7 @@ the environment variable `EDITOR`.
            repo = "/home/you/pkgs/sirius.db.tar.zst"
            pkgbuild_dir = ""
            use_cache = false
+           clean_src = false
            add_params = []
            rm_params = []
            ignore_aur = []
@@ -189,6 +190,7 @@ repo = "/home/you/pkgs/sirius.db.tar.zst"
 pkgbuild_dir = "/home/you/pkgbuilds"
 # Optional; disabled by default:
 # use_cache = true
+# clean_src = true
 ```
 
 ```console
@@ -239,6 +241,10 @@ Useful options:
   disabled by default. Its key covers the PKGBUILD fingerprint, signing
   settings, and makepkg flags; changes to `makepkg.conf` are not detected,
   so use `--clean-cache` after changing it.
+- When `clean_src = true`, repoctl sets `SRCDEST` to a temporary directory
+  for each build and removes it afterwards, so downloaded source files do
+  not accumulate next to the PKGBUILDs. `--clean` still controls the build
+  directories.
 - `--jobs N` builds up to N packages concurrently. Running builds finish
   when `--fail-fast` stops scheduling new ones.
 
