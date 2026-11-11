@@ -32,6 +32,12 @@ type Profile struct {
 	// It is disabled by default.
 	UseCache bool `toml:"use_cache"`
 
+	// CleanSrc makes sync download sources into a temporary SRCDEST
+	// directory that is removed after each build. It is disabled by
+	// default, which leaves source files in the PKGBUILD directory as
+	// makepkg normally does.
+	CleanSrc bool `toml:"clean_src"`
+
 	// AddParameters are parameters to add to the repo-add command line.
 	AddParameters []string `toml:"add_params"`
 	// RemoveParameters are parameters to add to the repo-remove command line.

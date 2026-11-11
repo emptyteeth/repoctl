@@ -24,6 +24,7 @@ var PropertiesTmpl = template.Must(template.New("properties").Funcs(template.Fun
         repo = {{ printt $value.Repository }}
         pkgbuild_dir = {{ printt $value.PkgBuildDir }}
         use_cache = {{ printt $value.UseCache }}
+        clean_src = {{ printt $value.CleanSrc }}
         add_params = {{ printt $value.AddParameters }}
         rm_params = {{ printt $value.RemoveParameters }}
         ignore_aur = {{ printt $value.IgnoreAUR }}
@@ -70,6 +71,11 @@ default_profile = {{ printt .DefaultProfile }}
   # The cache is disabled by default. Use "repoctl sync --clean-cache" to
   # remove an existing cache.
   use_cache = {{ printt $value.UseCache }}
+
+  # clean_src makes sync download sources into a temporary SRCDEST
+  # directory and remove it after each build. This keeps downloaded source
+  # files out of the PKGBUILD directories. It is disabled by default.
+  clean_src = {{ printt $value.CleanSrc }}
 
   # add_params is the set of parameters that will be passed to repo-add
   # when it is called. Specify one time for each parameter.
