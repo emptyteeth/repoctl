@@ -114,14 +114,15 @@ var syncCmd = &cobra.Command{
   PKGBUILDs are found. Debug packages named <pkgname>-debug are kept
   when their base package is present in the tree.
 
-  Built packages are cached in .repoctl/cache/ and reused when the same
-  PKGBUILD and build options are needed again, for example after a
-  repository database reset or for another profile. Use --clean-cache to
-  remove the cache. The cache key covers the PKGBUILD fingerprint,
-  signing settings, and makepkg flags; changes to makepkg.conf are not
-  detected, so use --clean-cache after changing it. --jobs builds up to N
-  packages concurrently; running builds are allowed to finish when
-  --fail-fast stops scheduling new ones.
+  Built packages are cached in .repoctl/cache/ when the profile sets
+  use_cache = true. The cache is disabled by default and is reused when
+  the same PKGBUILD and build options are needed again, for example after
+  a repository database reset or for another profile. Use --clean-cache
+  to remove an existing cache. The cache key covers the PKGBUILD
+  fingerprint, signing settings, and makepkg flags; changes to
+  makepkg.conf are not detected, so use --clean-cache after changing it.
+  --jobs builds up to N packages concurrently; running builds are allowed
+  to finish when --fail-fast stops scheduling new ones.
 
   Rebuilding a package without changing its version, for example with
   --force or --rebuild-changed, produces different bytes under the same
@@ -285,12 +286,13 @@ func runSync(cmd *cobra.Command, filters []string) error {
 		return nil
 	}
 
-	useCache := !syncRefresh && !syncNoState
+	useStateCache := !syncRefresh && !syncNoState
+	cacheEnabled := Profile != nil && Profile.UseCache
 	units := make([]*syncUnit, 0, len(dirs))
 	for _, dir := range dirs {
-		units = append(units, loadSyncUnit(root, dir, state, useCache))
+		units = append(units, loadSyncUnit(root, dir, state, useStateCache))
 	}
-	if !syncDryRun {
+	if !syncDryRun && cacheEnabled {
 		pruneSyncCache(root, units)
 	}
 
@@ -341,18 +343,20 @@ func runSync(cmd *cobra.Command, filters []string) error {
 		Key:   syncKey,
 		Flags: syncMakepkgFlags(),
 	}
-	for _, unit := range selected {
-		if unit.action != syncBuild && unit.action != syncRepair {
-			continue
-		}
-		unit.cacheDir = syncCacheDir(root, unit, buildOptions)
-		if syncForce || syncCleanCache {
-			continue
-		}
-		if paths, ok := syncCachedArtifacts(unit, unit.cacheDir); ok {
-			unit.action = syncAdd
-			unit.existing = paths
-			unit.cached = true
+	if cacheEnabled {
+		for _, unit := range selected {
+			if unit.action != syncBuild && unit.action != syncRepair {
+				continue
+			}
+			unit.cacheDir = syncCacheDir(root, unit, buildOptions)
+			if syncForce || syncCleanCache {
+				continue
+			}
+			if paths, ok := syncCachedArtifacts(unit, unit.cacheDir); ok {
+				unit.action = syncAdd
+				unit.existing = paths
+				unit.cached = true
+			}
 		}
 	}
 
@@ -463,7 +467,7 @@ func runSync(cmd *cobra.Command, filters []string) error {
 
 // loadSyncUnit reads the metadata for one PKGBUILD directory, using the
 // cached state entry when its fingerprint still matches.
-func loadSyncUnit(root, dir string, state *pkgbuild.State, useCache bool) *syncUnit {
+func loadSyncUnit(root, dir string, state *pkgbuild.State, useStateCache bool) *syncUnit {
 	unit := &syncUnit{
 		dir:  dir,
 		path: filepath.Join(root, dir),
@@ -484,7 +488,7 @@ func loadSyncUnit(root, dir string, state *pkgbuild.State, useCache bool) *syncU
 		entry  *pkgbuild.StateEntry
 		cached bool
 	)
-	if useCache {
+	if useStateCache {
 		entry, cached = state.Entry(dir, inspection.Fingerprint)
 	}
 
@@ -787,8 +791,10 @@ func buildSyncArtifacts(unit *syncUnit, options pkgbuild.BuildOptions, cacheDir 
 		result.paths = append(result.paths, pkg.Filename)
 	}
 
-	if err := cacheSyncArtifacts(cacheDir, artifacts); err != nil {
-		result.warning = fmt.Errorf("cannot cache packages: %w", err)
+	if cacheDir != "" {
+		if err := cacheSyncArtifacts(cacheDir, artifacts); err != nil {
+			result.warning = fmt.Errorf("cannot cache packages: %w", err)
+		}
 	}
 	return result
 }

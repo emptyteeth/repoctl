@@ -138,6 +138,7 @@ the environment variable `EDITOR`.
        [profiles.default]
            repo = "/home/you/pkgs/sirius.db.tar.zst"
            pkgbuild_dir = ""
+           use_cache = false
            add_params = []
            rm_params = []
            ignore_aur = []
@@ -186,6 +187,8 @@ you can let repoctl build and add everything that changed:
 [profiles.default]
 repo = "/home/you/pkgs/sirius.db.tar.zst"
 pkgbuild_dir = "/home/you/pkgbuilds"
+# Optional; disabled by default:
+# use_cache = true
 ```
 
 ```console
@@ -230,11 +233,12 @@ Useful options:
   `--syncdeps`, `--rmdeps`, `--nocheck`, and `--makepkg-arg`.
 - `--sign`, `--nosign`, and `--key` control package signing. Signing is
   enabled automatically when the profile sets `require_signature`.
-- Built packages are cached in `.repoctl/cache/` and reused when the same
-  PKGBUILD and build options are needed again, for example after a database
-  reset or for another profile. The cache key covers the PKGBUILD
-  fingerprint, signing settings, and makepkg flags; changes to
-  `makepkg.conf` are not detected, so use `--clean-cache` after changing it.
+- When `use_cache = true`, built packages are cached in `.repoctl/cache/`
+  and reused when the same PKGBUILD and build options are needed again, for
+  example after a database reset or for another profile. The cache is
+  disabled by default. Its key covers the PKGBUILD fingerprint, signing
+  settings, and makepkg flags; changes to `makepkg.conf` are not detected,
+  so use `--clean-cache` after changing it.
 - `--jobs N` builds up to N packages concurrently. Running builds finish
   when `--fail-fast` stops scheduling new ones.
 

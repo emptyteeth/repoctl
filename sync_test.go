@@ -426,6 +426,22 @@ func TestBuildSyncArtifactsWithFakeMakepkg(t *testing.T) {
 	if !fileExists(filepath.Join(unit.cacheDir, "foo-1.0-1-any.pkg.tar.gz")) {
 		t.Error("artifact was not written to the cache")
 	}
+
+	// An empty cache directory means caching is disabled; the build must
+	// still succeed without attempting to write a cache.
+	withoutCache := buildSyncArtifacts(unit, pkgbuild.BuildOptions{}, "")
+	if withoutCache.tempDir != "" {
+		defer os.RemoveAll(withoutCache.tempDir)
+	}
+	if withoutCache.err != nil {
+		t.Fatal(withoutCache.err)
+	}
+	if withoutCache.warning != nil {
+		t.Errorf("unexpected cache warning with caching disabled: %v", withoutCache.warning)
+	}
+	if len(withoutCache.paths) != 1 {
+		t.Fatalf("got %d artifact paths without cache, want 1", len(withoutCache.paths))
+	}
 }
 
 func TestCompleteSyncTargets(t *testing.T) {
